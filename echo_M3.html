@@ -1,0 +1,835 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>回声 ECHO · M3 闭环</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: #050608; overflow: hidden; }
+  canvas { display: block; cursor: crosshair; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+"use strict";
+/* ============================================================
+   《回声 ECHO》M3 —— 闭环切片
+   新增（相对 M2）：
+   - 出口：被回波揭示后长亮微光，进入即过关
+   - 3 个数据化关卡：一·苏醒 / 二·权衡 / 三·屏息
+   - 关卡流转：过关 → 白闪 → 下一层；通关 → 结算画面（用时+被捕次数）
+   - 死亡重试：重开当前层，尝试次数全局累计
+   - L3 机制「移动噪声」：移动会持续发出小半径噪声，敌人循声追踪
+   不含：音效（M4）
+   ============================================================ */
+
+/* ---------- 可调参数（手感调优区：只改这里） ---------- */
+const CONFIG = {
+  PLAYER_SPEED: 230,
+  PLAYER_RADIUS: 6,
+  PULSE_SPEED: 520,
+  PULSE_MAX_RADIUS: 550,
+  COOLDOWN: 1.2,
+  WALL_FADE: 2.2,
+  SUBSEG_LEN: 10,
+  EXIT_R: 26,
+  CLEAR_HOLD: 2.6,          // 过关画面停留时长
+};
+
+const MOVE_NOISE = {
+  INTERVAL: 0.5,             // 移动时发声间隔
+  RADIUS: 150,               // 敌人能听到的距离
+  MARK_FADE: 0.5,            // 脚步声标记显示时长
+  START_DELAY: 0.18,         // 起步到第一声的宽限
+};
+
+/* ---------- 关卡数据 ----------
+   每关：spawn 出生点 / exit 出口 / enemies 敌人（路径点+听觉+双速）
+   / moveNoise 该层是否开启脚步噪声 / walls 墙段
+   难度曲线：听力范围 450→500→520，循声速度 172→185→195
+   ------------------------------------------------ */
+const LEVELS = [
+  {
+    label: '一', title: '苏醒', sub: '黑暗中，只有你的呼吸',
+    spawn: { x: 130, y: 650 },
+    exit:  { x: 1150, y: 130 },
+    moveNoise: false,
+    enemies: [ { waypoints: [[560,200],[780,200],[780,600],[560,600]], hear: 450, patrol: 85, investigate: 172 } ],
+    walls: [
+      [40,40,1240,40],[1240,40,1240,760],[1240,760,40,760],[40,760,40,40],
+      [420,40,420,480],            // 左挡板：下方留门（y 480..760）
+      [820,280,820,760],           // 右挡板：上方留门（y 40..280）
+      [590,330,650,330],[650,330,650,390],[650,390,590,390],[590,390,590,330],
+      [150,300,190,300],[190,300,190,340],[190,340,150,340],[150,340,150,300],
+    ],
+  },
+  {
+    label: '二', title: '权衡', sub: '每一次倾听，都是一次暴露',
+    spawn: { x: 220, y: 140 },
+    exit:  { x: 1140, y: 660 },
+    moveNoise: false,
+    enemies: [ { waypoints: [[340,300],[340,500],[900,500],[900,300]], hear: 500, patrol: 95, investigate: 185 } ],
+    walls: [
+      [40,40,1240,40],[1240,40,1240,760],[1240,760,40,760],[40,760,40,40],
+      [40,240,200,240],[280,240,400,240],[400,40,400,240],
+      [840,40,840,240],[840,240,1000,240],[1080,240,1240,240],
+      [40,440,300,440],[380,440,860,440],[940,440,1240,440],
+      [40,560,180,560],[260,560,440,560],[440,560,440,760],
+      [800,560,800,760],[800,560,980,560],[1060,560,1240,560],
+      [600,320,660,320],[660,320,660,380],[660,380,600,380],[600,380,600,320],
+      [620,620,680,620],[680,620,680,680],[680,680,620,680],[620,680,620,620],
+      [170,330,210,330],[210,330,210,370],[210,370,170,370],[170,370,170,330],
+      [1030,640,1070,640],[1070,640,1070,680],[1070,680,1030,680],[1030,680,1030,640],
+    ],
+  },
+  {
+    label: '三', title: '屏息', sub: '现在，连脚步都有回声',
+    spawn: { x: 130, y: 690 },
+    exit:  { x: 1150, y: 120 },
+    moveNoise: true,
+    enemies: [
+      { waypoints: [[240,320],[560,320],[560,120],[240,120]], hear: 520, patrol: 100, investigate: 195 },
+      { waypoints: [[700,470],[1080,470],[1080,700],[700,700]], hear: 520, patrol: 100, investigate: 195 },
+    ],
+    walls: [
+      [40,40,1240,40],[1240,40,1240,760],[1240,760,40,760],[40,760,40,40],
+      [40,400,300,400],[380,400,860,400],[940,400,1240,400],  // 中部横墙，门洞 300..380 / 860..940
+      [640,40,640,200],                                        // 上立柱
+      [640,560,640,760],                                       // 下立柱
+      [200,560,260,560],[260,560,260,620],[260,620,200,620],[200,620,200,560],
+      [1000,200,1060,200],[1060,200,1060,260],[1060,260,1000,260],[1000,260,1000,200],
+    ],
+  },
+];
+
+/* ---------- 画布与视口 ---------- */
+const WORLD_W = 1280, WORLD_H = 800;
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+let scale=1, offX=0, offY=0, vignette=null;
+
+function resize(){
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width  = innerWidth * dpr;
+  canvas.height = innerHeight * dpr;
+  canvas.style.width  = innerWidth + 'px';
+  canvas.style.height = innerHeight + 'px';
+  scale = Math.min(innerWidth / WORLD_W, innerHeight / WORLD_H) * dpr;
+  offX  = (innerWidth * dpr  - WORLD_W * scale) / 2;
+  offY  = (innerHeight * dpr - WORLD_H * scale) / 2;
+  vignette = ctx.createRadialGradient(
+    canvas.width/2, canvas.height/2, Math.min(canvas.width, canvas.height)*0.35,
+    canvas.width/2, canvas.height/2, Math.max(canvas.width, canvas.height)*0.72
+  );
+  vignette.addColorStop(0,'rgba(0,0,0,0)');
+  vignette.addColorStop(1,'rgba(0,0,0,0.5)');
+}
+addEventListener('resize', resize);
+resize();
+
+/* ---------- 动态世界数据（随关卡重建） ---------- */
+let subsegs = [];        // 墙壁细分
+let walls = [];          // 当前关原始墙段（碰撞用）
+let exitZone = { x:0, y:0, discovered:false, litAt:-99 };
+const enemies = [];      // 当前关敌人实例
+
+/* ---------- 全局状态 ---------- */
+const state = {
+  time: 0, runTime: 0,
+  levelIndex: 0,
+  phase: 'PLAY',         // PLAY | DEAD | CLEAR | WIN
+  deadT: 0, clearT: 0, winT: 0,
+  attempts: 0,
+  charge: CONFIG.COOLDOWN,
+  player: { x: 0, y: 0 },
+  pulses: [],
+  marks: [],             // 声源标记 {x,y,t0,kind:'pulse'|'step'}
+  playerFlash: 0, deny: 0,
+  hintDone: false, hintPingT: -99,
+  exitHintT: -99,
+  introT: 0,
+  noiseT: 0, wasMoving: false,
+  shake: 0, redFlash: 0, whiteFlash: 0,
+  trail: [],                // 玩家微光尾迹
+  deathWave: -1,            // 死亡冲击波半径（-1 未激活）
+};
+let pulseIdCounter = 0;
+
+/* ---------- 关卡装载 ---------- */
+function makeEnemy(def){
+  return {
+    x: def.waypoints[0][0], y: def.waypoints[0][1],
+    wp: 1, mode: 'PATROL', target: null,
+    searchT: 0, searchHome: null, stuckT: 0,
+    lastX: def.waypoints[0][0], lastY: def.waypoints[0][1],
+    heading: 0, litAt: -99, litPulse: -1,
+    def,
+  };
+}
+
+function loadLevel(i){
+  const lvl = LEVELS[i];
+  state.levelIndex = i;
+  walls = lvl.walls;
+  subsegs = [];
+  for (const [x1,y1,x2,y2] of walls){
+    const len = Math.hypot(x2-x1, y2-y1);
+    const n = Math.max(1, Math.ceil(len / CONFIG.SUBSEG_LEN));
+    for (let k=0;k<n;k++){
+      const ax=x1+(x2-x1)*k/n,     ay=y1+(y2-y1)*k/n;
+      const bx=x1+(x2-x1)*(k+1)/n, by=y1+(y2-y1)*(k+1)/n;
+      subsegs.push({x1:ax,y1:ay,x2:bx,y2:by,mx:(ax+bx)/2,my:(ay+by)/2,litAt:-99,pulseId:-1});
+    }
+  }
+  exitZone = { x: lvl.exit.x, y: lvl.exit.y, discovered: false, litAt: -99 };
+  enemies.length = 0;
+  for (const d of lvl.enemies) enemies.push(makeEnemy(d));
+  state.player.x = lvl.spawn.x; state.player.y = lvl.spawn.y;
+  state.pulses.length = 0;
+  state.marks.length = 0;
+  state.charge = CONFIG.COOLDOWN;
+  state.phase = 'PLAY';
+  state.deadT = 0; state.clearT = 0;
+  state.playerFlash = 0; state.deny = 0;
+  state.noiseT = MOVE_NOISE.START_DELAY; state.wasMoving = false;
+  state.introT = 0;
+  state.trail.length = 0;
+  state.deathWave = -1;
+}
+
+function fullRestart(){
+  state.attempts = 0;
+  state.runTime = 0;
+  state.hintDone = false; state.hintPingT = -99;
+  state.exitHintT = -99;
+  state.winT = 0;
+  loadLevel(0);
+}
+
+loadLevel(0);
+
+/* ---------- 输入 ---------- */
+const keys = new Set();
+addEventListener('keydown', e => {
+  if (['ArrowUp','ArrowDown','ArrowLeft','ArrowRight','Space'].includes(e.code)) e.preventDefault();
+  keys.add(e.code);
+  if (state.phase === 'DEAD' && e.code === 'KeyR' && state.deadT > 0.5) loadLevel(state.levelIndex);
+  else if (state.phase === 'WIN' && e.code === 'KeyR' && state.winT > 0.6) fullRestart();
+  else if (state.phase === 'PLAY' && e.code === 'Space') emitPulse();
+});
+addEventListener('keyup', e => keys.delete(e.code));
+canvas.addEventListener('mousedown', () => {
+  if (state.phase === 'DEAD' && state.deadT > 0.5) loadLevel(state.levelIndex);
+  else if (state.phase === 'WIN' && state.winT > 0.6) fullRestart();
+  else if (state.phase === 'PLAY') emitPulse();
+});
+canvas.addEventListener('touchstart', e => {
+  e.preventDefault();
+  if (state.phase === 'DEAD' && state.deadT > 0.5) loadLevel(state.levelIndex);
+  else if (state.phase === 'WIN' && state.winT > 0.6) fullRestart();
+  else if (state.phase === 'PLAY') emitPulse();
+}, {passive:false});
+
+function emitPulse(){
+  if (state.charge < CONFIG.COOLDOWN){ state.deny = 0.25; return; }
+  const p = state.player;
+  state.charge = 0;
+  state.pulses.push({ id: ++pulseIdCounter, x: p.x, y: p.y, r: 0 });
+  state.playerFlash = 1;
+  if (!state.hintDone){ state.hintDone = true; state.hintPingT = state.time; }
+  state.marks.push({ x: p.x, y: p.y, t0: state.time, kind: 'pulse' });
+  for (const e of enemies){
+    if (Math.hypot(e.x - p.x, e.y - p.y) <= e.def.hear){
+      e.mode = 'INVESTIGATE';
+      e.target = { x: p.x, y: p.y };
+      e.stuckT = 0;
+    }
+  }
+}
+
+/* ---------- 碰撞 ---------- */
+function closestPointOnSeg(px,py, x1,y1,x2,y2){
+  const dx=x2-x1, dy=y2-y1;
+  const len2 = dx*dx + dy*dy;
+  let t = len2 > 0 ? ((px-x1)*dx + (py-y1)*dy) / len2 : 0;
+  t = Math.max(0, Math.min(1, t));
+  return { x: x1 + t*dx, y: y1 + t*dy };
+}
+function collideCircle(p, r){
+  for (let iter=0; iter<3; iter++){
+    let moved = false;
+    for (const w of walls){
+      const c = closestPointOnSeg(p.x,p.y, w[0],w[1],w[2],w[3]);
+      const dx = p.x-c.x, dy = p.y-c.y;
+      const d2 = dx*dx + dy*dy;
+      if (d2 < r*r){
+        const d = Math.sqrt(d2) || 0.0001;
+        p.x += dx/d * (r-d);
+        p.y += dy/d * (r-d);
+        moved = true;
+      }
+    }
+    if (!moved) break;
+  }
+  p.x = Math.max(40+r, Math.min(1240-r, p.x));
+  p.y = Math.max(40+r, Math.min(760-r, p.y));
+}
+
+/* ---------- 敌人 AI ---------- */
+function nearestWaypoint(e){
+  let best = 0, bd = Infinity;
+  for (let i=0;i<e.def.waypoints.length;i++){
+    const w = e.def.waypoints[i];
+    const d = Math.hypot(e.x-w[0], e.y-w[1]);
+    if (d < bd){ bd = d; best = i; }
+  }
+  e.wp = best;
+}
+
+function updateEnemy(e, dt){
+  if (e.mode === 'PATROL' || e.mode === 'RETURN'){
+    const w = e.def.waypoints[e.wp];
+    e.target = { x: w[0], y: w[1] };
+  } else if (e.mode === 'SEARCH'){
+    e.searchT -= dt;
+    if (!e.target || Math.hypot(e.target.x-e.x, e.target.y-e.y) < 20){
+      e.target = {
+        x: Math.max(60,  Math.min(1220, e.searchHome.x + (Math.random()*2-1)*70)),
+        y: Math.max(60,  Math.min(740, e.searchHome.y + (Math.random()*2-1)*70)),
+      };
+    }
+    if (e.searchT <= 0){ nearestWaypoint(e); e.mode = 'RETURN'; }
+  }
+
+  const sp = (e.mode === 'PATROL' || e.mode === 'RETURN') ? e.def.patrol : e.def.investigate;
+
+  if (e.target){
+    const dx = e.target.x - e.x, dy = e.target.y - e.y;
+    const d = Math.hypot(dx, dy);
+    if (d > 2){
+      e.x += dx/d * sp * dt;
+      e.y += dy/d * sp * dt;
+      e.heading = Math.atan2(dy, dx);
+    }
+    collideCircle(e, 14);
+
+    if (e.mode === 'PATROL' && d < 24){
+      e.wp = (e.wp + 1) % e.def.waypoints.length;
+    } else if (e.mode === 'INVESTIGATE' && d < 22){
+      e.mode = 'SEARCH';
+      e.searchT = 3.0;
+      e.searchHome = { x: e.target.x, y: e.target.y };
+      e.target = null;
+    } else if (e.mode === 'RETURN' && d < 24){
+      e.mode = 'PATROL';
+    }
+
+    const moved = Math.hypot(e.x - e.lastX, e.y - e.lastY);
+    if (moved < sp * dt * 0.25) e.stuckT += dt; else e.stuckT = 0;
+    if (e.stuckT > 1.5){
+      e.stuckT = 0;
+      if (e.mode === 'INVESTIGATE'){
+        e.mode = 'SEARCH'; e.searchT = 3.0;
+        e.searchHome = { x: e.x, y: e.y }; e.target = null;
+      } else if (e.mode === 'SEARCH'){
+        nearestWaypoint(e); e.mode = 'RETURN';
+      }
+    }
+  }
+  e.lastX = e.x; e.lastY = e.y;
+}
+
+/* ---------- 死亡 / 过关 ---------- */
+function killPlayer(){
+  state.phase = 'DEAD';
+  state.deadT = 0;
+  state.attempts++;
+  state.pulses.length = 0;
+  state.shake = 1;
+  state.redFlash = 1;
+  state.deathWave = 0;
+}
+
+function clearLevel(){
+  state.phase = 'CLEAR';
+  state.clearT = 0;
+  state.whiteFlash = 1;
+}
+
+/* ---------- 更新 ---------- */
+function update(dt){
+  state.time += dt;
+  state.shake = Math.max(0, state.shake - dt*2.5);
+  state.redFlash = Math.max(0, state.redFlash - dt*1.2);
+  state.whiteFlash = Math.max(0, state.whiteFlash - dt*2.2);
+
+  if (state.phase === 'DEAD'){
+    state.deadT += dt;
+    if (state.deathWave >= 0) state.deathWave += dt * 620;
+    return;
+  }
+  if (state.phase === 'CLEAR'){
+    state.clearT += dt;
+    if (state.clearT >= CONFIG.CLEAR_HOLD){
+      if (state.levelIndex + 1 < LEVELS.length) loadLevel(state.levelIndex + 1);
+      else { state.phase = 'WIN'; state.winT = 0; }
+    }
+    return;
+  }
+  if (state.phase === 'WIN'){ state.winT += dt; return; }
+
+  // ---- PLAY ----
+  state.runTime += dt;
+  state.introT += dt;
+  state.charge = Math.min(CONFIG.COOLDOWN, state.charge + dt);
+
+  const p = state.player;
+  let mx=0, my=0;
+  if (keys.has('KeyW') || keys.has('ArrowUp'))    my -= 1;
+  if (keys.has('KeyS') || keys.has('ArrowDown'))  my += 1;
+  if (keys.has('KeyA') || keys.has('ArrowLeft'))  mx -= 1;
+  if (keys.has('KeyD') || keys.has('ArrowRight')) mx += 1;
+  const moving = !!(mx || my);
+
+  if (moving){
+    const inv = 1 / Math.hypot(mx,my);
+    p.x += mx*inv * CONFIG.PLAYER_SPEED * dt;
+    p.y += my*inv * CONFIG.PLAYER_SPEED * dt;
+    collideCircle(p, CONFIG.PLAYER_RADIUS);
+    state.trail.push({ x: p.x, y: p.y, t: state.time });
+  }
+  while (state.trail.length && state.time - state.trail[0].t > 0.45) state.trail.shift();
+
+  // 移动噪声（L3）：起步短宽限后，每 INTERVAL 发出一次小半径噪声
+  if (LEVELS[state.levelIndex].moveNoise){
+    if (moving){
+      if (!state.wasMoving) state.noiseT = MOVE_NOISE.START_DELAY;
+      state.noiseT -= dt;
+      if (state.noiseT <= 0){
+        state.noiseT = MOVE_NOISE.INTERVAL;
+        state.marks.push({ x: p.x, y: p.y, t0: state.time, kind: 'step' });
+        for (const e of enemies){
+          if (Math.hypot(e.x - p.x, e.y - p.y) <= MOVE_NOISE.RADIUS){
+            e.mode = 'INVESTIGATE';
+            e.target = { x: p.x, y: p.y };
+            e.stuckT = 0;
+          }
+        }
+      }
+    } else {
+      state.noiseT = MOVE_NOISE.START_DELAY;
+    }
+    state.wasMoving = moving;
+  }
+
+  // 波纹扩散：点亮墙段 / 敌人 / 出口
+  for (const pu of state.pulses){
+    pu.r += CONFIG.PULSE_SPEED * dt;
+    const r2 = pu.r * pu.r;
+    for (const s of subsegs){
+      if (s.pulseId === pu.id) continue;
+      const dx = s.mx - pu.x, dy = s.my - pu.y;
+      const d2 = dx*dx + dy*dy;
+      if (d2 <= r2){
+        s.pulseId = pu.id;
+        s.litAt = state.time;
+        s.hitAt = state.time;
+        // 距离衰减：回波能量随传播距离下降（远处更弱更蓝）
+        const dist = Math.sqrt(d2);
+        s.energy = Math.pow(Math.max(0.06, 1 - dist / CONFIG.PULSE_MAX_RADIUS), 0.6);
+      }
+    }
+    for (const e of enemies){
+      if (e.litPulse !== pu.id && Math.hypot(e.x - pu.x, e.y - pu.y) <= pu.r){
+        e.litPulse = pu.id; e.litAt = state.time;
+        const de = Math.hypot(e.x - pu.x, e.y - pu.y);
+        e.litE = Math.pow(Math.max(0.15, 1 - de / CONFIG.PULSE_MAX_RADIUS), 0.6);
+      }
+    }
+    const de = Math.hypot(exitZone.x - pu.x, exitZone.y - pu.y);
+    if (de <= pu.r){
+      if (!exitZone.discovered){ exitZone.discovered = true; state.exitHintT = state.time; }
+      exitZone.litAt = state.time;
+    }
+  }
+  state.pulses = state.pulses.filter(pu => pu.r < CONFIG.PULSE_MAX_RADIUS);
+
+  // 出口：玩家微光范围内也能发现
+  if (!exitZone.discovered && Math.hypot(exitZone.x - p.x, exitZone.y - p.y) < 75){
+    exitZone.discovered = true;
+    exitZone.litAt = state.time;
+    state.exitHintT = state.time;
+  }
+
+  for (const e of enemies) updateEnemy(e, dt);
+
+  // 抓捕
+  for (const e of enemies){
+    if (Math.hypot(e.x - p.x, e.y - p.y) < CONFIG.PLAYER_RADIUS + 16){ killPlayer(); return; }
+  }
+
+  // 到达出口
+  if (Math.hypot(exitZone.x - p.x, exitZone.y - p.y) < CONFIG.EXIT_R + 6){ clearLevel(); return; }
+
+  state.playerFlash = Math.max(0, state.playerFlash - dt*3);
+  state.deny = Math.max(0, state.deny - dt);
+}
+
+/* ---------- 渲染 ---------- */
+function renderEnemy(e){
+  let a = 0;
+  const litAge = state.time - e.litAt;
+  if (litAge >= 0 && litAge < 1.8) a = (1 - litAge / 1.8) * (e.litE != null ? e.litE : 1);
+  const d = Math.hypot(e.x - state.player.x, e.y - state.player.y);
+  const glowA = d < 70 ? 0.35 * (1 - d / 70) : 0;
+  a = Math.max(a * 0.95, glowA, state.phase === 'DEAD' ? 1 : 0);
+  if (a <= 0.01) return;
+
+  const gl = ctx.createRadialGradient(e.x, e.y, 0, e.x, e.y, 34);
+  gl.addColorStop(0, 'rgba(255,80,70,' + (a*0.22).toFixed(3) + ')');
+  gl.addColorStop(1, 'rgba(255,80,70,0)');
+  ctx.fillStyle = gl;
+  ctx.beginPath(); ctx.arc(e.x, e.y, 34, 0, Math.PI*2); ctx.fill();
+  const g = ctx.createRadialGradient(e.x, e.y, 2, e.x, e.y, 14);
+  g.addColorStop(0, 'rgba(70,10,14,' + a.toFixed(3) + ')');
+  g.addColorStop(1, 'rgba(255,90,77,' + a.toFixed(3) + ')');
+  ctx.fillStyle = g;
+  ctx.beginPath(); ctx.arc(e.x, e.y, 14, 0, Math.PI*2); ctx.fill();
+  const hx = Math.cos(e.heading), hy = Math.sin(e.heading);
+  ctx.fillStyle = 'rgba(255,230,225,' + a.toFixed(3) + ')';
+  ctx.beginPath(); ctx.arc(e.x + hx*7, e.y + hy*7, 2.6, 0, Math.PI*2); ctx.fill();
+}
+
+function renderExit(){
+  if (!exitZone.discovered) return;
+  const litAge = state.time - exitZone.litAt;
+  const fresh = litAge >= 0 && litAge < 3 ? 1 - litAge/3 : 0;
+  const breathe = 0.12 + 0.06 * Math.sin(state.time * 3);
+  const a = Math.max(breathe, fresh * 0.9);
+  // 常亮微光（发现后）
+  const gl = ctx.createRadialGradient(exitZone.x, exitZone.y, 0, exitZone.x, exitZone.y, 46);
+  gl.addColorStop(0, 'rgba(92,245,168,' + (a*0.30).toFixed(3) + ')');
+  gl.addColorStop(1, 'rgba(92,245,168,0)');
+  ctx.fillStyle = gl;
+  ctx.beginPath(); ctx.arc(exitZone.x, exitZone.y, 46, 0, Math.PI*2); ctx.fill();
+  // 双环 + 心点
+  ctx.strokeStyle = 'rgba(92,245,168,' + (0.25 + fresh*0.7).toFixed(3) + ')';
+  ctx.lineWidth = 1.6;
+  ctx.beginPath(); ctx.arc(exitZone.x, exitZone.y, CONFIG.EXIT_R, 0, Math.PI*2); ctx.stroke();
+  ctx.strokeStyle = 'rgba(92,245,168,' + (0.14 + fresh*0.5).toFixed(3) + ')';
+  ctx.beginPath(); ctx.arc(exitZone.x, exitZone.y, CONFIG.EXIT_R - 9, 0, Math.PI*2); ctx.stroke();
+  // 外圈缓转虚线环（信标感）
+  ctx.save();
+  ctx.setLineDash([5, 9]);
+  ctx.lineDashOffset = -state.time * 22;
+  ctx.strokeStyle = 'rgba(92,245,168,' + (0.20 + fresh*0.45).toFixed(3) + ')';
+  ctx.lineWidth = 1.2;
+  ctx.beginPath(); ctx.arc(exitZone.x, exitZone.y, CONFIG.EXIT_R + 10, 0, Math.PI*2); ctx.stroke();
+  ctx.restore();
+  ctx.fillStyle = 'rgba(200,255,225,' + (0.3 + fresh*0.7).toFixed(3) + ')';
+  ctx.beginPath(); ctx.arc(exitZone.x, exitZone.y, 3.5, 0, Math.PI*2); ctx.fill();
+}
+
+function fmtTime(t){
+  const m = Math.floor(t/60), s = Math.floor(t%60);
+  return m + ':' + (s<10?'0':'') + s;
+}
+
+function render(){
+  const dpr = window.devicePixelRatio || 1;
+  ctx.setTransform(1,0,0,1,0,0);
+
+  if (state.phase === 'WIN'){
+    // 通关结算：纯黑 + 文字
+    ctx.fillStyle = '#050608';
+    ctx.fillRect(0,0,canvas.width,canvas.height);
+    ctx.textAlign = 'center';
+    const a = Math.min(1, state.winT / 1.2);
+    ctx.font = 'bold 52px "PingFang SC","Microsoft YaHei",sans-serif';
+    ctx.fillStyle = 'rgba(92,245,168,' + (a*0.95).toFixed(3) + ')';
+    ctx.fillText('地 面', canvas.width/2, canvas.height/2 - 60*dpr);
+    ctx.font = '15px "PingFang SC","Microsoft YaHei",sans-serif';
+    ctx.fillStyle = 'rgba(200,210,220,' + (a*0.8).toFixed(3) + ')';
+    ctx.fillText('你循着自己的回声，走回了光里。', canvas.width/2, canvas.height/2 - 10*dpr);
+    if (state.winT > 0.8){
+      const b = Math.min(1, (state.winT-0.8)/0.8);
+      ctx.font = '13px "PingFang SC","Microsoft YaHei",sans-serif';
+      ctx.fillStyle = 'rgba(140,150,165,' + (b*0.9).toFixed(3) + ')';
+      ctx.fillText('用时 ' + fmtTime(state.runTime) + '　·　被捕 ' + state.attempts + ' 次', canvas.width/2, canvas.height/2 + 40*dpr);
+    }
+    if (state.winT > 1.6){
+      const c = 0.5 + 0.35*Math.sin(state.time*4);
+      ctx.font = '14px "PingFang SC","Microsoft YaHei",sans-serif';
+      ctx.fillStyle = 'rgba(160,175,190,' + c.toFixed(3) + ')';
+      ctx.fillText('点击 或 按 R 从头再来', canvas.width/2, canvas.height/2 + 90*dpr);
+    }
+    return;
+  }
+
+  ctx.fillStyle = '#050608';
+  ctx.fillRect(0,0,canvas.width,canvas.height);
+
+  const shX = Math.sin(state.time*90) * state.shake * 9;
+  const shY = Math.cos(state.time*77) * state.shake * 7;
+  ctx.setTransform(scale,0,0,scale, offX + shX*scale, offY + shY*scale);
+
+  const p = state.player;
+
+  // 1. 点亮的墙段：发光叠加 + 距离衰减配色 + 波前扫过闪光
+  ctx.globalCompositeOperation = 'lighter';
+  for (const s of subsegs){
+    const age = state.time - s.litAt;
+    if (age < 0 || age > CONFIG.WALL_FADE) continue;
+    const decay = 1 - age / CONFIG.WALL_FADE;
+    const en = s.energy != null ? s.energy : 1;
+    const shimmer = 0.9 + 0.1 * Math.sin(state.time * 16 + s.mx * 0.37 + s.my * 0.71);
+    const a = decay * decay * en * shimmer;
+    // 近处回波偏白青，远处偏深蓝（衰减可视化）
+    const cr = Math.round(110 + 115 * en);
+    const cg = Math.round(165 + 77 * en);
+    ctx.strokeStyle = 'rgba(' + cr + ',' + cg + ',255,' + (a * a * 0.30).toFixed(3) + ')';
+    ctx.lineWidth = 5.5;
+    ctx.beginPath(); ctx.moveTo(s.x1,s.y1); ctx.lineTo(s.x2,s.y2); ctx.stroke();
+    ctx.strokeStyle = 'rgba(' + cr + ',' + cg + ',255,' + (a * 0.95).toFixed(3) + ')';
+    ctx.lineWidth = 1.4;
+    ctx.beginPath(); ctx.moveTo(s.x1,s.y1); ctx.lineTo(s.x2,s.y2); ctx.stroke();
+    // 波前刚扫过瞬间的白色高亮（扫描感）
+    const hit = Math.max(0, 1 - (state.time - s.hitAt) / 0.28);
+    if (hit > 0){
+      ctx.strokeStyle = 'rgba(255,255,255,' + (hit * hit * 0.85 * en).toFixed(3) + ')';
+      ctx.lineWidth = 2.4;
+      ctx.beginPath(); ctx.moveTo(s.x1,s.y1); ctx.lineTo(s.x2,s.y2); ctx.stroke();
+    }
+  }
+  ctx.globalCompositeOperation = 'source-over';
+
+  // 2. 出口
+  renderExit();
+
+  // 3. 声源标记：红色=脉冲声源 / 灰白=脚步噪声
+  for (let i=state.marks.length-1; i>=0; i--){
+    const m = state.marks[i];
+    const age = state.time - m.t0;
+    if (m.kind === 'pulse'){
+      if (age > 2){ state.marks.splice(i,1); continue; }
+      const a = (1 - age/2) * 0.55;
+      ctx.strokeStyle = 'rgba(255,90,77,' + a.toFixed(3) + ')';
+      ctx.lineWidth = 1.6;
+      ctx.beginPath(); ctx.arc(m.x, m.y, 16 + age*26, 0, Math.PI*2); ctx.stroke();
+    } else {
+      if (age > MOVE_NOISE.MARK_FADE){ state.marks.splice(i,1); continue; }
+      const k = age / MOVE_NOISE.MARK_FADE;
+      ctx.strokeStyle = 'rgba(190,200,215,' + ((1-k)*0.5).toFixed(3) + ')';
+      ctx.lineWidth = 1.2;
+      ctx.beginPath(); ctx.arc(m.x, m.y, 8 + k*18, 0, Math.PI*2); ctx.stroke();
+    }
+  }
+
+  // 4. 波纹环：色差外缘 + 尾随余振 + 源点闪光（发光叠加）
+  ctx.globalCompositeOperation = 'lighter';
+  for (const pu of state.pulses){
+    const k = 1 - pu.r / CONFIG.PULSE_MAX_RADIUS;
+    if (k <= 0) continue;
+    // 深蓝色差外缘
+    ctx.strokeStyle = 'rgba(70,130,230,' + (0.30*k).toFixed(3) + ')';
+    ctx.lineWidth = 3.2;
+    ctx.beginPath(); ctx.arc(pu.x,pu.y,pu.r+2.5,0,Math.PI*2); ctx.stroke();
+    // 主波前
+    ctx.strokeStyle = 'rgba(160,225,255,' + (0.60*k).toFixed(3) + ')';
+    ctx.lineWidth = 2.2;
+    ctx.beginPath(); ctx.arc(pu.x,pu.y,pu.r,0,Math.PI*2); ctx.stroke();
+    // 尾随次级波（声波余振）
+    if (pu.r > 34){
+      ctx.strokeStyle = 'rgba(120,190,255,' + (0.20*k).toFixed(3) + ')';
+      ctx.lineWidth = 1.1;
+      ctx.beginPath(); ctx.arc(pu.x,pu.y,pu.r-16,0,Math.PI*2); ctx.stroke();
+      ctx.strokeStyle = 'rgba(100,175,255,' + (0.10*k).toFixed(3) + ')';
+      ctx.beginPath(); ctx.arc(pu.x,pu.y,pu.r-32,0,Math.PI*2); ctx.stroke();
+    }
+    // 源点爆发闪光（发出后短时间）
+    if (pu.r < 160){
+      const f = Math.max(0, 1 - pu.r/160);
+      const og = ctx.createRadialGradient(pu.x,pu.y,0, pu.x,pu.y,34);
+      og.addColorStop(0,'rgba(210,240,255,' + (f*0.5).toFixed(3) + ')');
+      og.addColorStop(1,'rgba(210,240,255,0)');
+      ctx.fillStyle = og;
+      ctx.beginPath(); ctx.arc(pu.x,pu.y,34,0,Math.PI*2); ctx.fill();
+    }
+  }
+  ctx.globalCompositeOperation = 'source-over';
+
+  // 5. 敌人
+  for (const e of enemies) renderEnemy(e);
+
+  // 5.5 死亡冲击波：红色断层从玩家位置扩散
+  if (state.deathWave >= 0 && state.deathWave < 650){
+    const w = state.deathWave;
+    const a = Math.max(0, 1 - w/650);
+    ctx.strokeStyle = 'rgba(255,70,60,' + (a*0.5).toFixed(3) + ')';
+    ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.arc(state.player.x, state.player.y, w, 0, Math.PI*2); ctx.stroke();
+    ctx.strokeStyle = 'rgba(255,120,90,' + (a*0.25).toFixed(3) + ')';
+    ctx.lineWidth = 1.2;
+    ctx.beginPath(); ctx.arc(state.player.x, state.player.y, w*0.7, 0, Math.PI*2); ctx.stroke();
+  }
+
+  // 6. 玩家微光尾迹
+  ctx.globalCompositeOperation = 'lighter';
+  for (const tp of state.trail){
+    const a = 1 - (state.time - tp.t) / 0.45;
+    if (a <= 0) continue;
+    ctx.fillStyle = 'rgba(160,210,255,' + (a*a*0.16).toFixed(3) + ')';
+    ctx.beginPath(); ctx.arc(tp.x, tp.y, 2.6, 0, Math.PI*2); ctx.fill();
+  }
+  ctx.globalCompositeOperation = 'source-over';
+
+  // 7. 玩家
+  const glowR = 55 + state.playerFlash * 30;
+  const g = ctx.createRadialGradient(p.x,p.y,0, p.x,p.y,glowR);
+  g.addColorStop(0,'rgba(200,235,255,' + (0.26 + state.playerFlash*0.3).toFixed(3) + ')');
+  g.addColorStop(1,'rgba(200,235,255,0)');
+  ctx.fillStyle = g;
+  ctx.beginPath(); ctx.arc(p.x,p.y,glowR,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle = '#eaf6ff';
+  ctx.beginPath(); ctx.arc(p.x,p.y,5,0,Math.PI*2); ctx.fill();
+
+  // 7. 充能环
+  const frac = state.charge / CONFIG.COOLDOWN;
+  ctx.lineWidth = 1.5;
+  ctx.strokeStyle = 'rgba(120,140,160,0.25)';
+  ctx.beginPath(); ctx.arc(p.x,p.y,13,0,Math.PI*2); ctx.stroke();
+  if (state.deny > 0){
+    ctx.strokeStyle = 'rgba(232,70,58,' + state.deny.toFixed(2) + ')';
+    ctx.beginPath(); ctx.arc(p.x,p.y,13,0,Math.PI*2); ctx.stroke();
+  } else if (frac < 1){
+    ctx.strokeStyle = 'rgba(92,245,168,0.8)';
+    ctx.beginPath(); ctx.arc(p.x,p.y,13,-Math.PI/2, -Math.PI/2 + frac*Math.PI*2); ctx.stroke();
+  } else {
+    const breathe = 0.55 + 0.35*Math.sin(state.time*5);
+    ctx.strokeStyle = 'rgba(92,245,168,' + breathe.toFixed(2) + ')';
+    ctx.beginPath(); ctx.arc(p.x,p.y,13,0,Math.PI*2); ctx.stroke();
+  }
+
+  /* ---- 屏幕空间层 ---- */
+  ctx.setTransform(1,0,0,1,0,0);
+
+  // 危险感应：最近敌人的红边脉动
+  if (state.phase === 'PLAY'){
+    let nd = Infinity;
+    for (const e of enemies) nd = Math.min(nd, Math.hypot(e.x - p.x, e.y - p.y));
+    if (nd < 260){
+      const lvl = 1 - nd / 260;
+      const pulse = 0.55 + 0.45 * Math.sin(state.time * 7);
+      const a = lvl * lvl * 0.5 * pulse;
+      const dg = ctx.createRadialGradient(
+        canvas.width/2, canvas.height/2, Math.min(canvas.width, canvas.height)*0.42,
+        canvas.width/2, canvas.height/2, Math.max(canvas.width, canvas.height)*0.75
+      );
+      dg.addColorStop(0,'rgba(200,30,30,0)');
+      dg.addColorStop(1,'rgba(200,30,30,' + a.toFixed(3) + ')');
+      ctx.fillStyle = dg;
+      ctx.fillRect(0,0,canvas.width,canvas.height);
+    }
+  }
+
+  ctx.fillStyle = vignette;
+  ctx.fillRect(0,0,canvas.width,canvas.height);
+
+  if (state.redFlash > 0){
+    ctx.fillStyle = 'rgba(232,70,58,' + (state.redFlash*0.38).toFixed(3) + ')';
+    ctx.fillRect(0,0,canvas.width,canvas.height);
+  }
+  if (state.whiteFlash > 0){
+    ctx.fillStyle = 'rgba(230,245,255,' + (state.whiteFlash*0.85).toFixed(3) + ')';
+    ctx.fillRect(0,0,canvas.width,canvas.height);
+  }
+
+  // 关卡开场：层号 + 氛围副题
+  if (state.phase === 'PLAY' && state.introT < 3.7){
+    const t = state.introT;
+    const a = t < 0.5 ? t*2 : t > 2.8 ? Math.max(0, 1-(t-2.8)/0.9) : 1;
+    const lvl = LEVELS[state.levelIndex];
+    ctx.textAlign = 'center';
+    ctx.font = 'bold 40px "PingFang SC","Microsoft YaHei",sans-serif';
+    ctx.fillStyle = 'rgba(220,235,250,' + (a*0.9).toFixed(3) + ')';
+    ctx.fillText('— ' + lvl.label + ' —', canvas.width/2, canvas.height*0.30);
+    ctx.font = '14px "PingFang SC","Microsoft YaHei",sans-serif';
+    ctx.fillStyle = 'rgba(150,165,182,' + (a*0.85).toFixed(3) + ')';
+    ctx.fillText(lvl.title + '　·　' + lvl.sub, canvas.width/2, canvas.height*0.30 + 34*dpr);
+  }
+
+  // 提示
+  ctx.textAlign = 'center';
+  const lvl0 = state.levelIndex === 0;
+  if (!state.hintDone && state.time < 12 && lvl0){
+    ctx.font = '14px "PingFang SC","Microsoft YaHei",sans-serif';
+    ctx.fillStyle = 'rgba(160,175,190,0.75)';
+    ctx.fillText('WASD / 方向键 移动　·　点击 / 空格 发射声呐', canvas.width/2, 40*dpr);
+  }
+  if (lvl0 && state.time - state.hintPingT < 6 && state.hintPingT > 0){
+    ctx.font = '14px "PingFang SC","Microsoft YaHei",sans-serif';
+    ctx.fillStyle = 'rgba(255,120,110,0.7)';
+    ctx.fillText('—— 声音会引来它们 ——', canvas.width/2, 40*dpr);
+  }
+  if (state.time - state.exitHintT < 3 && state.exitHintT > 0){
+    ctx.font = '13px "PingFang SC","Microsoft YaHei",sans-serif';
+    ctx.fillStyle = 'rgba(92,245,168,0.75)';
+    ctx.fillText('—— 出口 ——', canvas.width/2, 40*dpr);
+  }
+
+  // HUD
+  ctx.textAlign = 'left';
+  ctx.font = '12px "PingFang SC","Microsoft YaHei",sans-serif';
+  ctx.fillStyle = 'rgba(120,130,145,0.5)';
+  ctx.fillText('第 ' + LEVELS[state.levelIndex].label + ' / ' + LEVELS.length + ' 层　·　第 ' + (state.attempts + 1) + ' 次尝试', 14*dpr, 24*dpr);
+
+  // 死亡遮罩
+  if (state.phase === 'DEAD' && state.deadT > 0.4){
+    ctx.fillStyle = 'rgba(5,6,8,0.55)';
+    ctx.fillRect(0,0,canvas.width,canvas.height);
+    ctx.textAlign = 'center';
+    ctx.font = 'bold 42px "PingFang SC","Microsoft YaHei",sans-serif';
+    ctx.fillStyle = 'rgba(255,90,77,0.95)';
+    ctx.fillText('被 发现 了', canvas.width/2, canvas.height/2 - 12*dpr);
+    ctx.font = '15px "PingFang SC","Microsoft YaHei",sans-serif';
+    ctx.fillStyle = 'rgba(200,210,220,0.8)';
+    ctx.fillText('点击 或 按 R 重新尝试', canvas.width/2, canvas.height/2 + 26*dpr);
+  }
+
+  // 过关遮罩
+  if (state.phase === 'CLEAR'){
+    const a = Math.min(1, state.clearT / 0.5);
+    ctx.fillStyle = 'rgba(5,6,8,' + (a*0.45).toFixed(3) + ')';
+    ctx.fillRect(0,0,canvas.width,canvas.height);
+    ctx.textAlign = 'center';
+    ctx.font = 'bold 36px "PingFang SC","Microsoft YaHei",sans-serif';
+    ctx.fillStyle = 'rgba(92,245,168,' + (a*0.95).toFixed(3) + ')';
+    ctx.fillText('第 ' + LEVELS[state.levelIndex].label + ' 层 · 通过', canvas.width/2, canvas.height/2);
+    if (state.levelIndex + 1 < LEVELS.length){
+      ctx.font = '14px "PingFang SC","Microsoft YaHei",sans-serif';
+      ctx.fillStyle = 'rgba(180,195,210,' + (a*0.7).toFixed(3) + ')';
+      ctx.fillText('深入…', canvas.width/2, canvas.height/2 + 34*dpr);
+    }
+  }
+
+  // 版本标
+  ctx.textAlign = 'right';
+  ctx.font = '12px "PingFang SC","Microsoft YaHei",sans-serif';
+  ctx.fillStyle = 'rgba(120,130,145,0.4)';
+  ctx.fillText('回声 ECHO · M3', canvas.width - 14*dpr, canvas.height - 14*dpr);
+}
+
+/* ---------- 主循环 ---------- */
+let last = performance.now();
+function loop(now){
+  const dt = Math.min((now - last) / 1000, 0.05);
+  last = now;
+  update(dt);
+  render();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>

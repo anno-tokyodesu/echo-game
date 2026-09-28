@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>回声 ECHO · M1 垂直切片</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: #050608; overflow: hidden; }
+  canvas { display: block; cursor: crosshair; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+"use strict";
+/* ============================================================
+   《回声 ECHO》M1 —— 啊哈时刻切片
+   范围：黑屏 + 移动 + 声呐脉冲 + 墙壁亮起渐隐
+   不含：敌人（M2）、过关流程（M3）、音效（M4）
+   ============================================================ */
+
+/* ---------- 可调参数（手感调优区：只改这里） ----------
+   觉得"不对劲"时优先动这几个数，不要动逻辑：
+   - 节奏太慢/太快  → COOLDOWN、PULSE_SPEED
+   - 看得不够远     → PULSE_MAX_RADIUS
+   - 墙亮得太久/太短 → WALL_FADE
+   ----------------------------------------------------- */
+const CONFIG = {
+  PLAYER_SPEED: 230,       // 移动速度 px/s
+  PLAYER_RADIUS: 6,        // 玩家碰撞半径
+  PULSE_SPEED: 520,        // 波纹扩散速度 px/s
+  PULSE_MAX_RADIUS: 1000,  // 波纹最远覆盖半径
+  COOLDOWN: 1.2,           // 脉冲充能时间 s
+  WALL_FADE: 2.2,          // 墙壁被点亮后的衰减时长 s
+  SUBSEG_LEN: 10,          // 墙壁细分长度（越小扫过越平滑）
+};
+
+/* ---------- 世界与地图 ---------- */
+const WORLD_W = 1280, WORLD_H = 800;
+
+// 墙段 [x1,y1,x2,y2] —— 手工布局：外边界 + 四个房间 + 中央立柱
+const RAW_WALLS = [
+  // 外边界
+  [40,40,1240,40],[1240,40,1240,760],[1240,760,40,760],[40,760,40,40],
+  // 上左房间 A（南侧墙留门洞 200~280）
+  [40,240,200,240],[280,240,400,240],[400,40,400,240],
+  // 上右房间 B（南侧墙留门洞 1000~1080）
+  [840,40,840,240],[840,240,1000,240],[1080,240,1240,240],
+  // 中部横墙（门洞 300~380 与 860~940）
+  [40,440,300,440],[380,440,860,440],[940,440,1240,440],
+  // 下左房间 C（北侧墙留门洞 180~260）
+  [40,560,180,560],[260,560,440,560],[440,560,440,760],
+  // 下右房间 D（北侧墙留门洞 980~1060）
+  [800,560,800,760],[800,560,980,560],[1060,560,1240,560],
+  // 中央大厅立柱
+  [600,320,660,320],[660,320,660,380],[660,380,600,380],[600,380,600,320],
+  // 下方走廊立柱
+  [620,620,680,620],[680,620,680,680],[680,680,620,680],[620,680,620,620],
+  // 零散小柱
+  [170,330,210,330],[210,330,210,370],[210,370,170,370],[170,370,170,330],
+  [1030,640,1070,640],[1070,640,1070,680],[1070,680,1030,680],[1030,680,1030,640],
+];
+
+// 把每面墙切成小段：波纹扫过时逐段点亮，产生"扩散揭示"效果
+const subsegs = [];
+for (const [x1,y1,x2,y2] of RAW_WALLS) {
+  const len = Math.hypot(x2-x1, y2-y1);
+  const n = Math.max(1, Math.ceil(len / CONFIG.SUBSEG_LEN));
+  for (let i=0;i<n;i++){
+    const ax=x1+(x2-x1)*i/n,     ay=y1+(y2-y1)*i/n;
+    const bx=x1+(x2-x1)*(i+1)/n, by=y1+(y2-y1)*(i+1)/n;
+    subsegs.push({x1:ax,y1:ay,x2:bx,y2:by,mx:(ax+bx)/2,my:(ay+by)/2,litAt:-99,pulseId:-1});
+  }
+}
+
+/* ---------- 画布与视口 ---------- */
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+let scale=1, offX=0, offY=0, vignette=null;
+
+function resize(){
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width  = innerWidth * dpr;
+  canvas.height = innerHeight * dpr;
+  canvas.style.width  = innerWidth + 'px';
+  canvas.style.height = innerHeight + 'px';
+  scale = Math.min(innerWidth / WORLD_W, innerHeight / WORLD_H) * dpr;
+  offX  = (innerWidth * dpr  - WORLD_W * scale) / 2;
+  offY  = (innerHeight * dpr - WORLD_H * scale) / 2;
+  // 暗角缓存（只在建尺寸时重建）
+  vignette = ctx.createRadialGradient(
+    canvas.width/2, canvas.height/2, Math.min(canvas.width, canvas.height)*0.35,
+    canvas.width/2, canvas.height/2, Math.max(canvas.width, canvas.height)*0.72
+  );
+  vignette.addColorStop(0,'rgba(0,0,0,0)');
+  vignette.addColorStop(1,'rgba(0,0,0,0.5)');
+}
+addEventListener('resize', resize);
+resize();
+
+/* ---------- 游戏状态 ---------- */
+const state = {
+  time: 0,
+  charge: CONFIG.COOLDOWN,   // 开局即可发射
+  player: { x: 720, y: 250 },
+  pulses: [],                // 活跃波纹 {id,x,y,r}
+  playerFlash: 0,            // 发射瞬间玩家点的闪光
+  deny: 0,                   // 充能未满时的拒绝反馈计时
+  hintDone: false,           // 首次发射后隐藏提示
+};
+let pulseIdCounter = 0;
+
+/* ---------- 输入 ---------- */
+const keys = new Set();
+addEventListener('keydown', e => {
+  if (['ArrowUp','ArrowDown','ArrowLeft','ArrowRight','Space'].includes(e.code)) e.preventDefault();
+  keys.add(e.code);
+  if (e.code === 'Space') emitPulse();
+});
+addEventListener('keyup', e => keys.delete(e.code));
+canvas.addEventListener('mousedown', emitPulse);
+canvas.addEventListener('touchstart', e => { e.preventDefault(); emitPulse(); }, {passive:false});
+
+function emitPulse(){
+  if (state.charge < CONFIG.COOLDOWN){ state.deny = 0.25; return; }
+  state.charge = 0;
+  state.pulses.push({ id: ++pulseIdCounter, x: state.player.x, y: state.player.y, r: 0 });
+  state.playerFlash = 1;
+  state.hintDone = true;
+}
+
+/* ---------- 碰撞：圆 vs 线段（推开法） ---------- */
+function closestPointOnSeg(px,py, x1,y1,x2,y2){
+  const dx=x2-x1, dy=y2-y1;
+  const len2 = dx*dx + dy*dy;
+  let t = len2 > 0 ? ((px-x1)*dx + (py-y1)*dy) / len2 : 0;
+  t = Math.max(0, Math.min(1, t));
+  return { x: x1 + t*dx, y: y1 + t*dy };
+}
+function collidePlayer(p){
+  for (let iter=0; iter<3; iter++){
+    let moved = false;
+    for (const w of RAW_WALLS){
+      const c = closestPointOnSeg(p.x,p.y, w[0],w[1],w[2],w[3]);
+      const dx = p.x-c.x, dy = p.y-c.y;
+      const d2 = dx*dx + dy*dy;
+      const r = CONFIG.PLAYER_RADIUS;
+      if (d2 < r*r){
+        const d = Math.sqrt(d2) || 0.0001;
+        p.x += dx/d * (r-d);
+        p.y += dy/d * (r-d);
+        moved = true;
+      }
+    }
+    if (!moved) break;
+  }
+  // 边界双保险
+  p.x = Math.max(46, Math.min(1234, p.x));
+  p.y = Math.max(46, Math.min(754, p.y));
+}
+
+/* ---------- 更新 ---------- */
+function update(dt){
+  state.time += dt;
+  state.charge = Math.min(CONFIG.COOLDOWN, state.charge + dt);
+
+  // 移动
+  let mx=0, my=0;
+  if (keys.has('KeyW') || keys.has('ArrowUp'))    my -= 1;
+  if (keys.has('KeyS') || keys.has('ArrowDown'))  my += 1;
+  if (keys.has('KeyA') || keys.has('ArrowLeft'))  mx -= 1;
+  if (keys.has('KeyD') || keys.has('ArrowRight')) mx += 1;
+  if (mx || my){
+    const inv = 1 / Math.hypot(mx,my);
+    state.player.x += mx*inv * CONFIG.PLAYER_SPEED * dt;
+    state.player.y += my*inv * CONFIG.PLAYER_SPEED * dt;
+    collidePlayer(state.player);
+  }
+
+  // 波纹扩散 + 点亮扫过的墙段
+  for (const pu of state.pulses){
+    pu.r += CONFIG.PULSE_SPEED * dt;
+    const r2 = pu.r * pu.r;
+    for (const s of subsegs){
+      if (s.pulseId === pu.id) continue;
+      const dx = s.mx - pu.x, dy = s.my - pu.y;
+      if (dx*dx + dy*dy <= r2){
+        s.pulseId = pu.id;
+        s.litAt = state.time;
+      }
+    }
+  }
+  state.pulses = state.pulses.filter(pu => pu.r < CONFIG.PULSE_MAX_RADIUS);
+
+  state.playerFlash = Math.max(0, state.playerFlash - dt*3);
+  state.deny = Math.max(0, state.deny - dt);
+}
+
+/* ---------- 渲染 ---------- */
+function render(){
+  // 底色（纯黑略偏蓝，比纯黑更有"深处"感）
+  ctx.setTransform(1,0,0,1,0,0);
+  ctx.fillStyle = '#050608';
+  ctx.fillRect(0,0,canvas.width,canvas.height);
+
+  // 进入世界坐标
+  ctx.setTransform(scale,0,0,scale,offX,offY);
+
+  const p = state.player;
+
+  // 1. 已点亮的墙段：辉光层 + 亮芯，随时间衰减
+  for (const s of subsegs){
+    const age = state.time - s.litAt;
+    if (age < 0 || age > CONFIG.WALL_FADE) continue;
+    const a = 1 - age / CONFIG.WALL_FADE;
+    ctx.strokeStyle = 'rgba(150,210,255,' + (a*a*0.35).toFixed(3) + ')';
+    ctx.lineWidth = 5;
+    ctx.beginPath(); ctx.moveTo(s.x1,s.y1); ctx.lineTo(s.x2,s.y2); ctx.stroke();
+    ctx.strokeStyle = 'rgba(225,242,255,' + (a*0.95).toFixed(3) + ')';
+    ctx.lineWidth = 1.4;
+    ctx.beginPath(); ctx.moveTo(s.x1,s.y1); ctx.lineTo(s.x2,s.y2); ctx.stroke();
+  }
+
+  // 2. 波纹环（主环 + 拖尾环，越远越淡）
+  for (const pu of state.pulses){
+    const k = 1 - pu.r / CONFIG.PULSE_MAX_RADIUS;
+    if (k <= 0) continue;
+    ctx.strokeStyle = 'rgba(140,220,255,' + (0.55*k).toFixed(3) + ')';
+    ctx.lineWidth = 2.5;
+    ctx.beginPath(); ctx.arc(pu.x,pu.y,pu.r,0,Math.PI*2); ctx.stroke();
+    if (pu.r > 10){
+      ctx.strokeStyle = 'rgba(140,220,255,' + (0.22*k).toFixed(3) + ')';
+      ctx.lineWidth = 1.2;
+      ctx.beginPath(); ctx.arc(pu.x,pu.y,pu.r-9,0,Math.PI*2); ctx.stroke();
+    }
+  }
+
+  // 3. 玩家：常亮微光晕 + 本体 + 发射闪光
+  const glowR = 55 + state.playerFlash * 30;
+  const g = ctx.createRadialGradient(p.x,p.y,0, p.x,p.y,glowR);
+  g.addColorStop(0,'rgba(200,235,255,' + (0.26 + state.playerFlash*0.3).toFixed(3) + ')');
+  g.addColorStop(1,'rgba(200,235,255,0)');
+  ctx.fillStyle = g;
+  ctx.beginPath(); ctx.arc(p.x,p.y,glowR,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle = '#eaf6ff';
+  ctx.beginPath(); ctx.arc(p.x,p.y,5,0,Math.PI*2); ctx.fill();
+
+  // 4. 充能环：未满画进度弧，满了呼吸提示；充能未满时点击闪红
+  const frac = state.charge / CONFIG.COOLDOWN;
+  ctx.lineWidth = 1.5;
+  ctx.strokeStyle = 'rgba(120,140,160,0.25)';
+  ctx.beginPath(); ctx.arc(p.x,p.y,13,0,Math.PI*2); ctx.stroke();
+  if (state.deny > 0){
+    ctx.strokeStyle = 'rgba(232,70,58,' + state.deny.toFixed(2) + ')';
+    ctx.beginPath(); ctx.arc(p.x,p.y,13,0,Math.PI*2); ctx.stroke();
+  } else if (frac < 1){
+    ctx.strokeStyle = 'rgba(92,245,168,0.8)';
+    ctx.beginPath(); ctx.arc(p.x,p.y,13,-Math.PI/2, -Math.PI/2 + frac*Math.PI*2); ctx.stroke();
+  } else {
+    const breathe = 0.55 + 0.35*Math.sin(state.time*5);
+    ctx.strokeStyle = 'rgba(92,245,168,' + breathe.toFixed(2) + ')';
+    ctx.beginPath(); ctx.arc(p.x,p.y,13,0,Math.PI*2); ctx.stroke();
+  }
+
+  // 5. 屏幕空间：暗角 + 提示 + 版本标
+  ctx.setTransform(1,0,0,1,0,0);
+  ctx.fillStyle = vignette;
+  ctx.fillRect(0,0,canvas.width,canvas.height);
+
+  if (!state.hintDone && state.time < 12){
+    ctx.font = '14px "PingFang SC","Microsoft YaHei",sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillStyle = 'rgba(160,175,190,0.75)';
+    ctx.fillText('WASD / 方向键 移动　·　点击 / 空格 发射声呐', canvas.width/2, 40*dprSafe());
+  }
+  ctx.font = '12px "PingFang SC","Microsoft YaHei",sans-serif';
+  ctx.textAlign = 'right';
+  ctx.fillStyle = 'rgba(120,130,145,0.4)';
+  ctx.fillText('回声 ECHO · M1', canvas.width - 14*dprSafe(), canvas.height - 14*dprSafe());
+}
+function dprSafe(){ return window.devicePixelRatio || 1; }
+
+/* ---------- 主循环 ---------- */
+let last = performance.now();
+function loop(now){
+  const dt = Math.min((now - last) / 1000, 0.05);
+  last = now;
+  update(dt);
+  render();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>

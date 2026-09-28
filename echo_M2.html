@@ -1,0 +1,548 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>回声 ECHO · M2 风险</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: #050608; overflow: hidden; }
+  canvas { display: block; cursor: crosshair; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+"use strict";
+/* ============================================================
+   《回声 ECHO》M2 —— 风险切片
+   新增（相对 M1）：
+   - 敌人状态机：巡逻 → 循声（走向声源）→ 搜索（原地徘徊）→ 返回巡逻
+   - 回波揭示敌人：波纹扫过敌人才短暂显形（与墙壁同规则）
+   - 危险感应：敌人靠近时屏幕边缘红色脉动（无音效期的视觉替代）
+   - 被抓：红闪 + 震屏 + 重开（点击 / R）
+   不含：过关流程（M3）、音效（M4）
+   ============================================================ */
+
+/* ---------- 可调参数（手感调优区：只改这里） ----------
+   - 追不上你     → ENEMY.INVESTIGATE_SPEED 调大
+   - 压力不够     → HEARING_RADIUS 调大 / PATROL_SPEED 调大
+   - 敌人太粘人   → SEARCH_TIME 调小
+   ----------------------------------------------------- */
+const CONFIG = {
+  PLAYER_SPEED: 230,
+  PLAYER_RADIUS: 6,
+  PULSE_SPEED: 520,
+  PULSE_MAX_RADIUS: 1000,
+  COOLDOWN: 1.2,
+  WALL_FADE: 2.2,
+  SUBSEG_LEN: 10,
+};
+
+const ENEMY = {
+  PATROL_SPEED: 95,        // 巡逻速度（慢，给你安全感）
+  INVESTIGATE_SPEED: 185,  // 循声速度（略慢于玩家 230，能跑掉但要绕）
+  RADIUS: 14,
+  HEARING_RADIUS: 500,     // 听到脉冲的距离（核心压力参数）
+  SEARCH_TIME: 3.0,        // 到达声源后徘徊时长
+  SEARCH_WANDER: 70,       // 徘徊半径
+  LIT_FADE: 1.8,           // 被回波点亮后的显形时长
+  SENSE_R: 70,             // 玩家微光内显形距离（最后的惊吓窗口）
+  DANGER_R: 260,           // 危险感应距离（红边脉动）
+  STUCK_TIME: 1.5,         // 卡墙多久放弃当前目标
+  WAYPOINTS: [[340,300],[340,500],[900,500],[900,300]], // 中央大厅环线
+};
+
+const SPAWN = { x: 220, y: 140 };  // 出生在左上房间 A 内
+
+/* ---------- 世界与地图（与 M1 相同） ---------- */
+const WORLD_W = 1280, WORLD_H = 800;
+
+const RAW_WALLS = [
+  [40,40,1240,40],[1240,40,1240,760],[1240,760,40,760],[40,760,40,40],
+  [40,240,200,240],[280,240,400,240],[400,40,400,240],
+  [840,40,840,240],[840,240,1000,240],[1080,240,1240,240],
+  [40,440,300,440],[380,440,860,440],[940,440,1240,440],
+  [40,560,180,560],[260,560,440,560],[440,560,440,760],
+  [800,560,800,760],[800,560,980,560],[1060,560,1240,560],
+  [600,320,660,320],[660,320,660,380],[660,380,600,380],[600,380,600,320],
+  [620,620,680,620],[680,620,680,680],[680,680,620,680],[620,680,620,620],
+  [170,330,210,330],[210,330,210,370],[210,370,170,370],[170,370,170,330],
+  [1030,640,1070,640],[1070,640,1070,680],[1070,680,1030,680],[1030,680,1030,640],
+];
+
+const subsegs = [];
+for (const [x1,y1,x2,y2] of RAW_WALLS) {
+  const len = Math.hypot(x2-x1, y2-y1);
+  const n = Math.max(1, Math.ceil(len / CONFIG.SUBSEG_LEN));
+  for (let i=0;i<n;i++){
+    const ax=x1+(x2-x1)*i/n,     ay=y1+(y2-y1)*i/n;
+    const bx=x1+(x2-x1)*(i+1)/n, by=y1+(y2-y1)*(i+1)/n;
+    subsegs.push({x1:ax,y1:ay,x2:bx,y2:by,mx:(ax+bx)/2,my:(ay+by)/2,litAt:-99,pulseId:-1});
+  }
+}
+
+/* ---------- 画布与视口 ---------- */
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+let scale=1, offX=0, offY=0, vignette=null;
+
+function resize(){
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width  = innerWidth * dpr;
+  canvas.height = innerHeight * dpr;
+  canvas.style.width  = innerWidth + 'px';
+  canvas.style.height = innerHeight + 'px';
+  scale = Math.min(innerWidth / WORLD_W, innerHeight / WORLD_H) * dpr;
+  offX  = (innerWidth * dpr  - WORLD_W * scale) / 2;
+  offY  = (innerHeight * dpr - WORLD_H * scale) / 2;
+  vignette = ctx.createRadialGradient(
+    canvas.width/2, canvas.height/2, Math.min(canvas.width, canvas.height)*0.35,
+    canvas.width/2, canvas.height/2, Math.max(canvas.width, canvas.height)*0.72
+  );
+  vignette.addColorStop(0,'rgba(0,0,0,0)');
+  vignette.addColorStop(1,'rgba(0,0,0,0.5)');
+}
+addEventListener('resize', resize);
+resize();
+
+/* ---------- 游戏状态 ---------- */
+const state = {
+  time: 0,
+  charge: CONFIG.COOLDOWN,
+  player: { x: SPAWN.x, y: SPAWN.y },
+  pulses: [],
+  playerFlash: 0,
+  deny: 0,
+  hintDone: false,
+  hintPingT: -99,           // 首次发射时间（用于第二句提示）
+  heard: null,              // 敌人听到的声源标记 {x,y,t0}
+  dead: false,
+  deadT: 0,
+  attempts: 0,              // 被抓次数
+  shake: 0,
+  redFlash: 0,
+};
+let pulseIdCounter = 0;
+
+const enemy = {
+  x: ENEMY.WAYPOINTS[0][0], y: ENEMY.WAYPOINTS[0][1],
+  wp: 1,                    // 下一个巡逻路径点下标
+  mode: 'PATROL',           // PATROL | INVESTIGATE | SEARCH | RETURN
+  target: null,
+  searchT: 0,
+  searchHome: null,
+  stuckT: 0,
+  lastX: ENEMY.WAYPOINTS[0][0], lastY: ENEMY.WAYPOINTS[0][1],
+  heading: 0,
+  litAt: -99, litPulse: -1,
+};
+
+/* ---------- 输入 ---------- */
+const keys = new Set();
+addEventListener('keydown', e => {
+  if (['ArrowUp','ArrowDown','ArrowLeft','ArrowRight','Space'].includes(e.code)) e.preventDefault();
+  keys.add(e.code);
+  if (state.dead){
+    if (e.code === 'KeyR' && state.deadT > 0.5) resetRun();
+    return;
+  }
+  if (e.code === 'Space') emitPulse();
+});
+addEventListener('keyup', e => keys.delete(e.code));
+canvas.addEventListener('mousedown', () => {
+  if (state.dead){ if (state.deadT > 0.5) resetRun(); return; }
+  emitPulse();
+});
+canvas.addEventListener('touchstart', e => {
+  e.preventDefault();
+  if (state.dead){ if (state.deadT > 0.5) resetRun(); return; }
+  emitPulse();
+}, {passive:false});
+
+function emitPulse(){
+  if (state.charge < CONFIG.COOLDOWN){ state.deny = 0.25; return; }
+  state.charge = 0;
+  state.pulses.push({ id: ++pulseIdCounter, x: state.player.x, y: state.player.y, r: 0 });
+  state.playerFlash = 1;
+  if (!state.hintDone){ state.hintDone = true; state.hintPingT = state.time; }
+  // 敌人循声：脉冲即声源
+  const d = Math.hypot(enemy.x - state.player.x, enemy.y - state.player.y);
+  if (d <= ENEMY.HEARING_RADIUS){
+    enemy.mode = 'INVESTIGATE';
+    enemy.target = { x: state.player.x, y: state.player.y };
+    enemy.stuckT = 0;
+    state.heard = { x: state.player.x, y: state.player.y, t0: state.time };
+  }
+}
+
+/* ---------- 碰撞：圆 vs 线段（推开法，玩家/敌人通用） ---------- */
+function closestPointOnSeg(px,py, x1,y1,x2,y2){
+  const dx=x2-x1, dy=y2-y1;
+  const len2 = dx*dx + dy*dy;
+  let t = len2 > 0 ? ((px-x1)*dx + (py-y1)*dy) / len2 : 0;
+  t = Math.max(0, Math.min(1, t));
+  return { x: x1 + t*dx, y: y1 + t*dy };
+}
+function collideCircle(p, r){
+  for (let iter=0; iter<3; iter++){
+    let moved = false;
+    for (const w of RAW_WALLS){
+      const c = closestPointOnSeg(p.x,p.y, w[0],w[1],w[2],w[3]);
+      const dx = p.x-c.x, dy = p.y-c.y;
+      const d2 = dx*dx + dy*dy;
+      if (d2 < r*r){
+        const d = Math.sqrt(d2) || 0.0001;
+        p.x += dx/d * (r-d);
+        p.y += dy/d * (r-d);
+        moved = true;
+      }
+    }
+    if (!moved) break;
+  }
+  p.x = Math.max(40+r, Math.min(1240-r, p.x));
+  p.y = Math.max(40+r, Math.min(760-r, p.y));
+}
+
+/* ---------- 敌人 AI ---------- */
+function nearestWaypoint(){
+  let best = 0, bd = Infinity;
+  for (let i=0;i<ENEMY.WAYPOINTS.length;i++){
+    const w = ENEMY.WAYPOINTS[i];
+    const d = Math.hypot(enemy.x-w[0], enemy.y-w[1]);
+    if (d < bd){ bd = d; best = i; }
+  }
+  enemy.wp = best;
+}
+
+function updateEnemy(dt){
+  if (enemy.mode === 'PATROL' || enemy.mode === 'RETURN'){
+    const w = ENEMY.WAYPOINTS[enemy.wp];
+    enemy.target = { x: w[0], y: w[1] };
+  } else if (enemy.mode === 'SEARCH'){
+    enemy.searchT -= dt;
+    if (!enemy.target || Math.hypot(enemy.target.x-enemy.x, enemy.target.y-enemy.y) < 20){
+      // 在声源附近随机徘徊
+      enemy.target = {
+        x: Math.max(60,  Math.min(1220, enemy.searchHome.x + (Math.random()*2-1)*ENEMY.SEARCH_WANDER)),
+        y: Math.max(60,  Math.min(740, enemy.searchHome.y + (Math.random()*2-1)*ENEMY.SEARCH_WANDER)),
+      };
+    }
+    if (enemy.searchT <= 0){ nearestWaypoint(); enemy.mode = 'RETURN'; }
+  }
+
+  const sp = (enemy.mode === 'PATROL' || enemy.mode === 'RETURN') ? ENEMY.PATROL_SPEED : ENEMY.INVESTIGATE_SPEED;
+
+  if (enemy.target){
+    const dx = enemy.target.x - enemy.x, dy = enemy.target.y - enemy.y;
+    const d = Math.hypot(dx, dy);
+    if (d > 2){
+      enemy.x += dx/d * sp * dt;
+      enemy.y += dy/d * sp * dt;
+      enemy.heading = Math.atan2(dy, dx);
+    }
+    collideCircle(enemy, ENEMY.RADIUS);
+
+    if (enemy.mode === 'PATROL' && d < 24){
+      enemy.wp = (enemy.wp + 1) % ENEMY.WAYPOINTS.length;
+    } else if (enemy.mode === 'INVESTIGATE' && d < 22){
+      enemy.mode = 'SEARCH';
+      enemy.searchT = ENEMY.SEARCH_TIME;
+      enemy.searchHome = { x: enemy.target.x, y: enemy.target.y };
+      enemy.target = null;
+    } else if (enemy.mode === 'RETURN' && d < 24){
+      enemy.mode = 'PATROL';
+    }
+
+    // 卡墙检测：推不动就放弃当前目标
+    const moved = Math.hypot(enemy.x - enemy.lastX, enemy.y - enemy.lastY);
+    if (moved < sp * dt * 0.25) enemy.stuckT += dt; else enemy.stuckT = 0;
+    if (enemy.stuckT > ENEMY.STUCK_TIME){
+      enemy.stuckT = 0;
+      if (enemy.mode === 'INVESTIGATE'){
+        enemy.mode = 'SEARCH';
+        enemy.searchT = ENEMY.SEARCH_TIME;
+        enemy.searchHome = { x: enemy.x, y: enemy.y };
+        enemy.target = null;
+      } else if (enemy.mode === 'SEARCH'){
+        nearestWaypoint(); enemy.mode = 'RETURN';
+      }
+    }
+  }
+  enemy.lastX = enemy.x; enemy.lastY = enemy.y;
+}
+
+/* ---------- 死亡与重开 ---------- */
+function killPlayer(){
+  state.dead = true;
+  state.deadT = 0;
+  state.attempts++;
+  state.pulses.length = 0;
+  state.shake = 1;
+  state.redFlash = 1;
+}
+
+function resetRun(){
+  state.player.x = SPAWN.x; state.player.y = SPAWN.y;
+  state.pulses.length = 0;
+  state.charge = CONFIG.COOLDOWN;
+  state.dead = false; state.deadT = 0;
+  state.heard = null;
+  state.playerFlash = 0; state.deny = 0;
+  for (const s of subsegs){ s.litAt = -99; s.pulseId = -1; }
+  enemy.x = ENEMY.WAYPOINTS[0][0]; enemy.y = ENEMY.WAYPOINTS[0][1];
+  enemy.lastX = enemy.x; enemy.lastY = enemy.y;
+  enemy.wp = 1; enemy.mode = 'PATROL'; enemy.target = null;
+  enemy.searchT = 0; enemy.searchHome = null; enemy.stuckT = 0;
+  enemy.litAt = -99; enemy.litPulse = -1;
+}
+
+/* ---------- 更新 ---------- */
+function update(dt){
+  state.time += dt;
+  state.shake = Math.max(0, state.shake - dt*2.5);
+  state.redFlash = Math.max(0, state.redFlash - dt*1.2);
+
+  if (state.dead){
+    state.deadT += dt;
+    return; // 死亡后世界冻结，只留视觉衰减
+  }
+
+  state.charge = Math.min(CONFIG.COOLDOWN, state.charge + dt);
+
+  // 玩家移动
+  let mx=0, my=0;
+  if (keys.has('KeyW') || keys.has('ArrowUp'))    my -= 1;
+  if (keys.has('KeyS') || keys.has('ArrowDown'))  my += 1;
+  if (keys.has('KeyA') || keys.has('ArrowLeft'))  mx -= 1;
+  if (keys.has('KeyD') || keys.has('ArrowRight')) mx += 1;
+  if (mx || my){
+    const inv = 1 / Math.hypot(mx,my);
+    state.player.x += mx*inv * CONFIG.PLAYER_SPEED * dt;
+    state.player.y += my*inv * CONFIG.PLAYER_SPEED * dt;
+    collideCircle(state.player, CONFIG.PLAYER_RADIUS);
+  }
+
+  // 波纹扩散：点亮墙段 + 点亮敌人
+  for (const pu of state.pulses){
+    pu.r += CONFIG.PULSE_SPEED * dt;
+    const r2 = pu.r * pu.r;
+    for (const s of subsegs){
+      if (s.pulseId === pu.id) continue;
+      const dx = s.mx - pu.x, dy = s.my - pu.y;
+      if (dx*dx + dy*dy <= r2){
+        s.pulseId = pu.id;
+        s.litAt = state.time;
+      }
+    }
+    if (enemy.litPulse !== pu.id){
+      const d = Math.hypot(enemy.x - pu.x, enemy.y - pu.y);
+      if (d <= pu.r){ enemy.litPulse = pu.id; enemy.litAt = state.time; }
+    }
+  }
+  state.pulses = state.pulses.filter(pu => pu.r < CONFIG.PULSE_MAX_RADIUS);
+
+  updateEnemy(dt);
+
+  // 抓捕判定
+  const cd = Math.hypot(enemy.x - state.player.x, enemy.y - state.player.y);
+  if (cd < CONFIG.PLAYER_RADIUS + ENEMY.RADIUS + 2) killPlayer();
+
+  state.playerFlash = Math.max(0, state.playerFlash - dt*3);
+  state.deny = Math.max(0, state.deny - dt);
+}
+
+/* ---------- 渲染 ---------- */
+function renderEnemy(){
+  let a = 0;
+  const litAge = state.time - enemy.litAt;
+  if (litAge >= 0 && litAge < ENEMY.LIT_FADE) a = 1 - litAge / ENEMY.LIT_FADE;
+  const d = Math.hypot(enemy.x - state.player.x, enemy.y - state.player.y);
+  const glowA = d < ENEMY.SENSE_R ? 0.35 * (1 - d / ENEMY.SENSE_R) : 0;
+  a = Math.max(a * 0.95, glowA, state.dead ? 1 : 0);
+  if (a <= 0.01) return;
+
+  // 外圈辉光
+  const gl = ctx.createRadialGradient(enemy.x, enemy.y, 0, enemy.x, enemy.y, 34);
+  gl.addColorStop(0, 'rgba(255,80,70,' + (a*0.22).toFixed(3) + ')');
+  gl.addColorStop(1, 'rgba(255,80,70,0)');
+  ctx.fillStyle = gl;
+  ctx.beginPath(); ctx.arc(enemy.x, enemy.y, 34, 0, Math.PI*2); ctx.fill();
+  // 身体
+  const g = ctx.createRadialGradient(enemy.x, enemy.y, 2, enemy.x, enemy.y, ENEMY.RADIUS);
+  g.addColorStop(0, 'rgba(70,10,14,' + a.toFixed(3) + ')');
+  g.addColorStop(1, 'rgba(255,90,77,' + a.toFixed(3) + ')');
+  ctx.fillStyle = g;
+  ctx.beginPath(); ctx.arc(enemy.x, enemy.y, ENEMY.RADIUS, 0, Math.PI*2); ctx.fill();
+  // 朝向眼点（读出运动方向）
+  const hx = Math.cos(enemy.heading), hy = Math.sin(enemy.heading);
+  ctx.fillStyle = 'rgba(255,230,225,' + a.toFixed(3) + ')';
+  ctx.beginPath(); ctx.arc(enemy.x + hx*7, enemy.y + hy*7, 2.6, 0, Math.PI*2); ctx.fill();
+}
+
+function render(){
+  ctx.setTransform(1,0,0,1,0,0);
+  ctx.fillStyle = '#050608';
+  ctx.fillRect(0,0,canvas.width,canvas.height);
+
+  // 震屏偏移（被抓瞬间）
+  const shX = Math.sin(state.time*90) * state.shake * 9;
+  const shY = Math.cos(state.time*77) * state.shake * 7;
+  ctx.setTransform(scale,0,0,scale, offX + shX*scale, offY + shY*scale);
+
+  const p = state.player;
+
+  // 1. 已点亮的墙段
+  for (const s of subsegs){
+    const age = state.time - s.litAt;
+    if (age < 0 || age > CONFIG.WALL_FADE) continue;
+    const a = 1 - age / CONFIG.WALL_FADE;
+    ctx.strokeStyle = 'rgba(150,210,255,' + (a*a*0.35).toFixed(3) + ')';
+    ctx.lineWidth = 5;
+    ctx.beginPath(); ctx.moveTo(s.x1,s.y1); ctx.lineTo(s.x2,s.y2); ctx.stroke();
+    ctx.strokeStyle = 'rgba(225,242,255,' + (a*0.95).toFixed(3) + ')';
+    ctx.lineWidth = 1.4;
+    ctx.beginPath(); ctx.moveTo(s.x1,s.y1); ctx.lineTo(s.x2,s.y2); ctx.stroke();
+  }
+
+  // 2. 声源标记：敌人"听到了这里"（无字教学的关键反馈）
+  if (state.heard){
+    const age = state.time - state.heard.t0;
+    if (age < 2){
+      const a = (1 - age/2) * 0.55;
+      ctx.strokeStyle = 'rgba(255,90,77,' + a.toFixed(3) + ')';
+      ctx.lineWidth = 1.6;
+      ctx.beginPath(); ctx.arc(state.heard.x, state.heard.y, 16 + age*26, 0, Math.PI*2); ctx.stroke();
+    } else {
+      state.heard = null;
+    }
+  }
+
+  // 3. 波纹环
+  for (const pu of state.pulses){
+    const k = 1 - pu.r / CONFIG.PULSE_MAX_RADIUS;
+    if (k <= 0) continue;
+    ctx.strokeStyle = 'rgba(140,220,255,' + (0.55*k).toFixed(3) + ')';
+    ctx.lineWidth = 2.5;
+    ctx.beginPath(); ctx.arc(pu.x,pu.y,pu.r,0,Math.PI*2); ctx.stroke();
+    if (pu.r > 10){
+      ctx.strokeStyle = 'rgba(140,220,255,' + (0.22*k).toFixed(3) + ')';
+      ctx.lineWidth = 1.2;
+      ctx.beginPath(); ctx.arc(pu.x,pu.y,pu.r-9,0,Math.PI*2); ctx.stroke();
+    }
+  }
+
+  // 4. 敌人（只在回波/微光/死亡中可见）
+  renderEnemy();
+
+  // 5. 玩家
+  const glowR = 55 + state.playerFlash * 30;
+  const g = ctx.createRadialGradient(p.x,p.y,0, p.x,p.y,glowR);
+  g.addColorStop(0,'rgba(200,235,255,' + (0.26 + state.playerFlash*0.3).toFixed(3) + ')');
+  g.addColorStop(1,'rgba(200,235,255,0)');
+  ctx.fillStyle = g;
+  ctx.beginPath(); ctx.arc(p.x,p.y,glowR,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle = '#eaf6ff';
+  ctx.beginPath(); ctx.arc(p.x,p.y,5,0,Math.PI*2); ctx.fill();
+
+  // 6. 充能环
+  const frac = state.charge / CONFIG.COOLDOWN;
+  ctx.lineWidth = 1.5;
+  ctx.strokeStyle = 'rgba(120,140,160,0.25)';
+  ctx.beginPath(); ctx.arc(p.x,p.y,13,0,Math.PI*2); ctx.stroke();
+  if (state.deny > 0){
+    ctx.strokeStyle = 'rgba(232,70,58,' + state.deny.toFixed(2) + ')';
+    ctx.beginPath(); ctx.arc(p.x,p.y,13,0,Math.PI*2); ctx.stroke();
+  } else if (frac < 1){
+    ctx.strokeStyle = 'rgba(92,245,168,0.8)';
+    ctx.beginPath(); ctx.arc(p.x,p.y,13,-Math.PI/2, -Math.PI/2 + frac*Math.PI*2); ctx.stroke();
+  } else {
+    const breathe = 0.55 + 0.35*Math.sin(state.time*5);
+    ctx.strokeStyle = 'rgba(92,245,168,' + breathe.toFixed(2) + ')';
+    ctx.beginPath(); ctx.arc(p.x,p.y,13,0,Math.PI*2); ctx.stroke();
+  }
+
+  /* ---- 屏幕空间层 ---- */
+  ctx.setTransform(1,0,0,1,0,0);
+
+  // 危险感应：敌人靠近时红边脉动（代替脚步声）
+  if (!state.dead){
+    const d = Math.hypot(enemy.x - p.x, enemy.y - p.y);
+    if (d < ENEMY.DANGER_R){
+      const lvl = 1 - d / ENEMY.DANGER_R;
+      const pulse = 0.55 + 0.45 * Math.sin(state.time * 7);
+      const a = lvl * lvl * 0.5 * pulse;
+      const dg = ctx.createRadialGradient(
+        canvas.width/2, canvas.height/2, Math.min(canvas.width, canvas.height)*0.42,
+        canvas.width/2, canvas.height/2, Math.max(canvas.width, canvas.height)*0.75
+      );
+      dg.addColorStop(0,'rgba(200,30,30,0)');
+      dg.addColorStop(1,'rgba(200,30,30,' + a.toFixed(3) + ')');
+      ctx.fillStyle = dg;
+      ctx.fillRect(0,0,canvas.width,canvas.height);
+    }
+  }
+
+  // 基础暗角
+  ctx.fillStyle = vignette;
+  ctx.fillRect(0,0,canvas.width,canvas.height);
+
+  // 死亡红闪
+  if (state.redFlash > 0){
+    ctx.fillStyle = 'rgba(232,70,58,' + (state.redFlash*0.38).toFixed(3) + ')';
+    ctx.fillRect(0,0,canvas.width,canvas.height);
+  }
+
+  const dpr = window.devicePixelRatio || 1;
+
+  // 提示
+  ctx.textAlign = 'center';
+  if (!state.hintDone && state.time < 12){
+    ctx.font = '14px "PingFang SC","Microsoft YaHei",sans-serif';
+    ctx.fillStyle = 'rgba(160,175,190,0.75)';
+    ctx.fillText('WASD / 方向键 移动　·　点击 / 空格 发射声呐', canvas.width/2, 40*dpr);
+  }
+  if (state.time - state.hintPingT < 6 && state.hintPingT > 0){
+    ctx.font = '14px "PingFang SC","Microsoft YaHei",sans-serif';
+    ctx.fillStyle = 'rgba(255,120,110,0.7)';
+    ctx.fillText('—— 声音会引来它们 ——', canvas.width/2, 40*dpr);
+  }
+
+  // 尝试次数
+  ctx.textAlign = 'left';
+  ctx.font = '12px "PingFang SC","Microsoft YaHei",sans-serif';
+  ctx.fillStyle = 'rgba(120,130,145,0.5)';
+  ctx.fillText('第 ' + (state.attempts + 1) + ' 次尝试', 14*dpr, 24*dpr);
+
+  // 死亡遮罩
+  if (state.dead && state.deadT > 0.4){
+    ctx.textAlign = 'center';
+    ctx.fillStyle = 'rgba(5,6,8,0.55)';
+    ctx.fillRect(0,0,canvas.width,canvas.height);
+    ctx.font = 'bold 42px "PingFang SC","Microsoft YaHei",sans-serif';
+    ctx.fillStyle = 'rgba(255,90,77,0.95)';
+    ctx.fillText('被 发现 了', canvas.width/2, canvas.height/2 - 12*dpr);
+    ctx.font = '15px "PingFang SC","Microsoft YaHei",sans-serif';
+    ctx.fillStyle = 'rgba(200,210,220,0.8)';
+    ctx.fillText('点击 或 按 R 重新尝试', canvas.width/2, canvas.height/2 + 26*dpr);
+  }
+
+  // 版本标
+  ctx.textAlign = 'right';
+  ctx.font = '12px "PingFang SC","Microsoft YaHei",sans-serif';
+  ctx.fillStyle = 'rgba(120,130,145,0.4)';
+  ctx.fillText('回声 ECHO · M2', canvas.width - 14*dpr, canvas.height - 14*dpr);
+}
+
+/* ---------- 主循环 ---------- */
+let last = performance.now();
+function loop(now){
+  const dt = Math.min((now - last) / 1000, 0.05);
+  last = now;
+  update(dt);
+  render();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
